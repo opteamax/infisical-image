@@ -1,0 +1,227 @@
+name: Build patched Infisical image
+
+# Builds the newest upstream Infisical release with the Opteamax patch on top
+# and publishes it as ghcr.io/opteamax/infisical:<upstream tag>. A GitHub
+# release named after the upstream tag marks a build that went all the way
+# through; its build.json is what the AWX upgrade job reads.
+
+on:
+  schedule:
+    - cron: "23 0 * * *"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Upstream tag to build (default: latest upstream release)"
+        required: false
+        default: ""
+      force:
+        description: "Rebuild even if this version was built before"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+  packages: write
+
+concurrency:
+  group: build
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPO: Infisical/infisical
+  PATCH_REPO: opteamax/infisical
+  PATCH_BRANCH: feat/opteamax-acme-dns
+  # A tag that already carries this line has the patch merged upstream.
+  PATCH_MARKER_FILE: backend/src/services/app-connection/app-connection-enums.ts
+  PATCH_MARKER: 'Opteamax = "opteamax"'
+  IMAGE: ghcr.io/opteamax/infisical
+
+jobs:
+  resolve:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.pick.outputs.version }}
+      build: ${{ steps.pick.outputs.build }}
+      previous: ${{ steps.pick.outputs.previous }}
+    steps:
+      - name: Pick the version to build
+        id: pick
+        env:
+          GH_TOKEN: ${{ github.token }}
+          WANTED: ${{ inputs.version }}
+          FORCE: ${{ inputs.force }}
+        run: |
+          set -euo pipefail
+          version="$WANTED"
+          if [ -z "$version" ]; then
+            version=$(gh api "repos/$UPSTREAM_REPO/releases/latest" --jq .tag_name)
+          fi
+          if ! printf '%s' "$version" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "::error::'$version' is not a plain release tag"
+            exit 1
+          fi
+          previous=$(gh release list -R "$GITHUB_REPOSITORY" --limit 1 --json tagName --jq '.[0].tagName // ""')
+          build=true
+          if [ "$FORCE" != "true" ] && gh release view "$version" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            build=false
+            echo "$version was built before, nothing to do."
+          fi
+          {
+            echo "version=$version"
+            echo "build=$build"
+            echo "previous=$previous"
+          } >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: resolve
+    if: needs.resolve.outputs.build == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      VERSION: ${{ needs.resolve.outputs.version }}
+      PREVIOUS: ${{ needs.resolve.outputs.previous }}
+    steps:
+      - name: Check out this repository
+        uses: actions/checkout@v4
+        with:
+          path: tools
+
+      - name: Check out upstream at ${{ needs.resolve.outputs.version }}
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.UPSTREAM_REPO }}
+          ref: ${{ needs.resolve.outputs.version }}
+          path: src
+          fetch-depth: 0
+          filter: blob:none
+
+      - name: Put the patch on top
+        id: patch
+        working-directory: src
+        run: |
+          set -euo pipefail
+          if grep -qF "$PATCH_MARKER" "$PATCH_MARKER_FILE"; then
+            echo "The patch is part of $VERSION upstream; building it unchanged."
+            echo "patched=false" >> "$GITHUB_OUTPUT"
+            echo "commit=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          git config user.name "opteamax-build"
+          git config user.email "opteamax-build@users.noreply.github.com"
+          git fetch --filter=blob:none "https://github.com/$PATCH_REPO.git" "$PATCH_BRANCH"
+          tip=$(git rev-parse FETCH_HEAD)
+          git fetch --filter=blob:none origin main
+          base=$(git merge-base origin/main "$tip")
+          count=$(git rev-list --count "$base..$tip")
+          if [ "$count" -eq 0 ]; then
+            echo "::error::$PATCH_BRANCH holds no commits on top of upstream main"
+            exit 1
+          fi
+          echo "Applying $count commit(s) from $PATCH_BRANCH"
+          if ! git cherry-pick "$base..$tip"; then
+            echo "::error::The patch no longer applies to $VERSION. Rebase $PATCH_BRANCH in $PATCH_REPO."
+            git status --short
+            exit 1
+          fi
+          grep -qF "$PATCH_MARKER" "$PATCH_MARKER_FILE"
+          echo "patched=true" >> "$GITHUB_OUTPUT"
+          echo "commit=$tip" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Node
+        if: steps.patch.outputs.patched == 'true'
+        uses: actions/setup-node@v4
+        with:
+          node-version: 26
+          cache: npm
+          cache-dependency-path: src/backend/package-lock.json
+
+      - name: Type-check the backend and run the DNS provider tests
+        if: steps.patch.outputs.patched == 'true'
+        working-directory: src/backend
+        run: |
+          set -euo pipefail
+          npm ci --no-audit --no-fund
+          npm run type:check
+          npx vitest run -c vitest.unit.config.mts src/services/certificate-authority/acme/dns-providers/
+
+      - name: Work out what the upgrade means for operators
+        id: impact
+        run: |
+          # The note for a release is committed to main after the tag is cut,
+          # so the notes are read from main, not from the tree being built.
+          git -C src fetch --filter=blob:none origin main
+          mkdir notes
+          git -C src archive FETCH_HEAD upgrade-impact/data/releases | tar -x -C notes
+          python3 tools/scripts/impact.py notes/upgrade-impact/data/releases "$PREVIOUS" "$VERSION" > impact.json
+          cat impact.json
+          echo "level=$(python3 -c 'import json; print(json.load(open("impact.json"))["level"])')" >> "$GITHUB_OUTPUT"
+
+      - name: Read pinned build versions
+        working-directory: src
+        run: grep -E '^[A-Z_]+=' build-versions.env >> "$GITHUB_ENV"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Build and push
+        id: push
+        uses: docker/build-push-action@v6
+        with:
+          context: src
+          file: src/Dockerfile.standalone-infisical
+          platforms: linux/amd64
+          push: true
+          tags: ${{ env.IMAGE }}:${{ env.VERSION }}
+          build-args: |
+            INFISICAL_CLI_VERSION=${{ env.INFISICAL_CLI_VERSION }}
+            INFISICAL_PLATFORM_VERSION=${{ env.VERSION }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.version=${{ env.VERSION }}
+            de.opteamax.infisical.upstream=${{ env.VERSION }}
+            de.opteamax.infisical.patched=${{ steps.patch.outputs.patched }}
+            de.opteamax.infisical.patch-commit=${{ steps.patch.outputs.commit }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Publish the release that marks this build as good
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DIGEST: ${{ steps.push.outputs.digest }}
+          PATCHED: ${{ steps.patch.outputs.patched }}
+          PATCH_COMMIT: ${{ steps.patch.outputs.commit }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, os, datetime
+          impact = json.load(open("impact.json"))
+          build = {
+              "version": os.environ["VERSION"],
+              "image": f'{os.environ["IMAGE"]}:{os.environ["VERSION"]}',
+              "digest": os.environ["DIGEST"],
+              "patched": os.environ["PATCHED"] == "true",
+              "patch_commit": os.environ["PATCH_COMMIT"],
+              "previous": os.environ["PREVIOUS"],
+              "impact": impact,
+              "built_at": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+          }
+          json.dump(build, open("build.json", "w"), indent=2)
+          lines = [
+              f'Upstream `{build["version"]}`' + (" with the Opteamax DNS provider patch." if build["patched"] else " (patch is upstream, built unchanged)."),
+              "",
+              f'Image: `{build["image"]}@{build["digest"]}`',
+              "",
+              f'Upgrade impact since `{build["previous"] or "n/a"}`: **{impact["level"]}**',
+          ]
+          for note in impact["notes"]:
+              lines.append(f'- `{note["version"]}` ({note["level"]}): {note["summary"]}')
+          open("notes.md", "w").write("\n".join(lines) + "\n")
+          PY
+          gh release delete "$VERSION" -R "$GITHUB_REPOSITORY" --yes --cleanup-tag 2>/dev/null || true
+          gh release create "$VERSION" build.json -R "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" --title "$VERSION" --notes-file notes.md --latest
