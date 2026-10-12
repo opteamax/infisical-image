@@ -218,7 +218,7 @@ jobs:
               "",
               f'Upgrade impact since `{build["previous"] or "n/a"}`: **{impact["level"]}**',
           ]
-          for note in impact["notes"]:
+          for note in (n for n in impact["notes"] if n["since_previous"]):
               lines.append(f'- `{note["version"]}` ({note["level"]}): {note["summary"]}')
           open("notes.md", "w").write("\n".join(lines) + "\n")
           PY

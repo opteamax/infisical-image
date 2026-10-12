@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
-"""Summarise upstream's upgrade-impact notes for a range of releases.
+"""Collect upstream's upgrade-impact notes up to a release.
 
 Usage: impact.py <releases dir> <previous tag or ""> <target tag>
 
-Prints JSON: the highest impact level of any release after <previous> up to
-and including <target>, and one note per release that is not "none". With no
-previous tag only the target release itself is looked at.
+Prints JSON with one entry per release up to <target> whose note is not
+"none", each marked with whether it lies after <previous>, and `level`: the
+highest level among those that do. Whoever upgrades should not rely on `level`
+alone — it describes the step from the previous BUILD, and the instance being
+upgraded may be further behind. The full list is there so the consumer can
+take the highest level of everything newer than what it actually runs.
 
 Upstream does not publish a note for every tag, and the one for a new release
 can lag its tag by a day. A missing note for the target is therefore reported
@@ -37,10 +40,6 @@ def main():
         tag = path.stem
         if key(tag) > key(target):
             continue
-        if previous and key(tag) <= key(previous):
-            continue
-        if not previous and tag != target:
-            continue
         seen_target = seen_target or tag == target
         text = path.read_text()
         level = field(text, "impactLevel").lower()
@@ -48,8 +47,9 @@ def main():
             # a level this script does not know must not pass as harmless
             level = "high"
         if level != "none":
-            notes.append({"version": tag, "level": level, "summary": field(text, "summary")})
-    level = max((note["level"] for note in notes), key=RANK.get, default="none")
+            since = key(tag) > key(previous) if previous else tag == target
+            notes.append({"version": tag, "level": level, "since_previous": since, "summary": field(text, "summary")})
+    level = max((n["level"] for n in notes if n["since_previous"]), key=RANK.get, default="none")
     print(json.dumps({"level": level, "target_note": seen_target, "notes": notes}, indent=2))
 
 
